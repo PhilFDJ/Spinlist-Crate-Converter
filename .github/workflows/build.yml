@@ -1,0 +1,165 @@
+name: Build & Release
+
+# Publishing a version tag (e.g. v1.0.0) builds, signs, notarises, and attaches
+# the .dmg to the GitHub release. Runs on GitHub's macOS servers, which have a
+# complete Apple certificate chain — so none of the local keychain issues apply.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:   # allows a manual run (builds artifacts, no release)
+
+permissions:
+  contents: write      # needed to attach files to the release
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      # ---- Import the Developer ID signing certificate from secrets ----
+      # Creates a temporary keychain, imports the .p12, and makes it available
+      # to codesign. The keychain is thrown away when the runner finishes.
+      - name: Import signing certificate
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}                    # base64 of your .p12
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}    # the .p12 password
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASS="$(uuidgen)"
+
+          # Decode the .p12 from the secret.
+          echo "$CSC_LINK" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+
+          # Create and unlock a temporary keychain.
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+
+          # Import the cert; allow codesign/productsign to use it non-interactively.
+          security import "$RUNNER_TEMP/cert.p12" -P "$CSC_KEY_PASSWORD" \
+            -k "$KEYCHAIN" -T /usr/bin/codesign -T /usr/bin/productsign
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASS" "$KEYCHAIN" >/dev/null
+
+          # Put our keychain first in the search list so codesign finds the identity.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+
+          # Sanity check: show the identity we imported.
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      # ---- Compile the universal binary and assemble the .app ----
+      - name: Build app bundle
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          APP_NAME="Spinlist Crate Converter"
+          MIN_MACOS="12.0"
+          BUILD="build"; DIST="dist"; APP="$BUILD/$APP_NAME.app"
+          rm -rf "$BUILD" "$DIST"; mkdir -p "$BUILD" "$DIST"
+
+          echo "==> Compiling universal binary…"
+          for arch in arm64 x86_64; do
+            xcrun swiftc -parse-as-library -O \
+              -target ${arch}-apple-macos${MIN_MACOS} \
+              src/SpinlistCrateConverter.swift \
+              -o "$BUILD/scc-${arch}"
+          done
+          lipo -create -output "$BUILD/SpinlistCrateConverter" "$BUILD/scc-arm64" "$BUILD/scc-x86_64"
+
+          echo "==> Assembling app bundle…"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "$BUILD/SpinlistCrateConverter" "$APP/Contents/MacOS/SpinlistCrateConverter"
+          cp assets/Info.plist "$APP/Contents/Info.plist"
+          # Icon and logo are optional — copy if present.
+          [ -f assets/AppIcon.icns ] && cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns" || echo "(no AppIcon.icns)"
+          [ -f assets/dropmark.png ] && cp assets/dropmark.png "$APP/Contents/Resources/dropmark.png" || echo "(no dropmark.png)"
+          chmod +x "$APP/Contents/MacOS/SpinlistCrateConverter"
+
+      # ---- Sign the app with hardened runtime ----
+      - name: Codesign
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          APP_NAME="Spinlist Crate Converter"
+          APP="build/$APP_NAME.app"
+          IDENTITY="Developer ID Application"
+          echo "==> Codesigning…"
+          codesign --force --options runtime --timestamp \
+            --sign "$IDENTITY" "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
+
+      # ---- Build the DMG ----
+      - name: Build DMG
+        run: |
+          set -euo pipefail
+          APP_NAME="Spinlist Crate Converter"
+          APP="build/$APP_NAME.app"; DIST="dist"
+          STAGE="build/dmg-stage"; rm -rf "$STAGE"; mkdir -p "$STAGE"
+          cp -R "$APP" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" \
+            -ov -format UDZO "$DIST/$APP_NAME.dmg" >/dev/null
+          codesign --force --timestamp --sign "Developer ID Application" "$DIST/$APP_NAME.dmg"
+
+      # ---- Notarise + staple both app and DMG ----
+      - name: Notarise
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          APP_NAME="Spinlist Crate Converter"
+          APP="build/$APP_NAME.app"; DIST="dist"
+
+          echo "==> Notarising the app…"
+          ditto -c -k --keepParent "$APP" "build/app.zip"
+          xcrun notarytool submit "build/app.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple "$APP"
+
+          echo "==> Rebuilding DMG around the stapled app…"
+          STAGE="build/dmg-stage"; rm -rf "$STAGE"; mkdir -p "$STAGE"
+          cp -R "$APP" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          rm -f "$DIST/$APP_NAME.dmg"
+          hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" \
+            -ov -format UDZO "$DIST/$APP_NAME.dmg" >/dev/null
+          codesign --force --timestamp --sign "Developer ID Application" "$DIST/$APP_NAME.dmg"
+
+          echo "==> Notarising the DMG…"
+          xcrun notarytool submit "$DIST/$APP_NAME.dmg" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple "$DIST/$APP_NAME.dmg"
+          xcrun stapler validate "$DIST/$APP_NAME.dmg"
+
+      # ---- Rename to the download filename the website expects ----
+      - name: Prepare release asset
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp "dist/Spinlist Crate Converter.dmg" "release/Spinlist.Crate.Converter.dmg"
+
+      # ---- Upload as a build artifact (always) ----
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Spinlist-Crate-Converter-dmg
+          path: release/Spinlist.Crate.Converter.dmg
+
+      # ---- Attach to the GitHub release (only on a tag push) ----
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/Spinlist.Crate.Converter.dmg
