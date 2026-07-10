@@ -120,9 +120,17 @@ jobs:
           APP_NAME="Spinlist Crate Converter"
           APP="build/$APP_NAME.app"; DIST="dist"
 
-          # Reconstruct the .p8 key file from the base64 secret.
+          # Reconstruct the .p8 key file from the secret. The secret holds the
+          # RAW .p8 text (BEGIN/END PRIVATE KEY block), written verbatim.
           KEYFILE="$RUNNER_TEMP/notary_key.p8"
-          echo "$APPLE_API_KEY_P8" | base64 --decode > "$KEYFILE"
+          printf '%s' "$APPLE_API_KEY_P8" > "$KEYFILE"
+          # Sanity: the file must contain a PRIVATE KEY header, or notarytool
+          # will report invalidPrivateKeyContents.
+          if ! grep -q "BEGIN PRIVATE KEY" "$KEYFILE"; then
+            echo "ERROR: APPLE_API_KEY_P8 secret does not contain a valid .p8 key."
+            echo "It should be the full BEGIN PRIVATE KEY ... END PRIVATE KEY block."
+            exit 1
+          fi
 
           echo "==> Notarising the app…"
           ditto -c -k --keepParent "$APP" "build/app.zip"
